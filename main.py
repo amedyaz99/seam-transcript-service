@@ -86,10 +86,11 @@ async def get_transcript(req: TranscriptRequest):
     async def fetch_transcript():
         nonlocal transcript_result, transcript_error, raw_exception
         try:
-            # v1.0 API: YouTubeTranscriptApi.fetch(video_id)
+            # v1.0: instantiate first, then call fetch() as instance method
+            api = YouTubeTranscriptApi()
             fetched = await loop.run_in_executor(
                 None,
-                lambda: YouTubeTranscriptApi.fetch(video_id),
+                lambda: api.fetch(video_id, languages=["en", "en-US", "en-GB"]),
             )
             transcript_result = [
                 {"text": s.text, "start": s.start, "duration": s.duration}
@@ -98,11 +99,11 @@ async def get_transcript(req: TranscriptRequest):
         except TranscriptsDisabled:
             transcript_error = {"status": 404, "error": "no_transcript", "message": "This video doesn't have captions available."}
         except NoTranscriptFound:
-            # Try any available language as fallback
             try:
+                api = YouTubeTranscriptApi()
                 transcript_list = await loop.run_in_executor(
                     None,
-                    lambda: YouTubeTranscriptApi.list(video_id),
+                    lambda: api.list(video_id),
                 )
                 first = next(iter(transcript_list))
                 fetched = await loop.run_in_executor(None, lambda: first.fetch())
