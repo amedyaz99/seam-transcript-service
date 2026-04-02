@@ -11,6 +11,7 @@ from youtube_transcript_api._errors import (
     NoTranscriptFound,
     VideoUnavailable,
 )
+from youtube_transcript_api.proxies import GenericProxyConfig
 
 app = FastAPI(title="Seam Transcript Service", version="1.0.0")
 
@@ -85,9 +86,16 @@ async def get_transcript(req: TranscriptRequest):
 
     async def fetch_transcript():
         nonlocal transcript_result, transcript_error, raw_exception
+
+        # Initialize API with proxy if available
+        proxy_url = os.environ.get("PROXY_URL")
+        proxy_config = None
+        if proxy_url:
+            proxy_config = GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
+
         try:
             # v1.0: instantiate first, then call fetch() as instance method
-            api = YouTubeTranscriptApi()
+            api = YouTubeTranscriptApi(proxy_config=proxy_config)
             fetched = await loop.run_in_executor(
                 None,
                 lambda: api.fetch(video_id, languages=["en", "en-US", "en-GB"]),
@@ -100,7 +108,7 @@ async def get_transcript(req: TranscriptRequest):
             transcript_error = {"status": 404, "error": "no_transcript", "message": "This video doesn't have captions available."}
         except NoTranscriptFound:
             try:
-                api = YouTubeTranscriptApi()
+                api = YouTubeTranscriptApi(proxy_config=proxy_config)
                 transcript_list = await loop.run_in_executor(
                     None,
                     lambda: api.list(video_id),
