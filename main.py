@@ -91,7 +91,10 @@ async def get_transcript(req: TranscriptRequest):
         proxy_url = os.environ.get("PROXY_URL")
         proxy_config = None
         if proxy_url:
+            print(f"[DEBUG] Using proxy: {proxy_url[:30]}...")
             proxy_config = GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
+        else:
+            print("[DEBUG] PROXY_URL not set - requests may be IP blocked")
 
         try:
             # v1.0: instantiate first, then call fetch() as instance method
