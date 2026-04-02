@@ -5,8 +5,8 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from youtube_transcript_api import (
-    YouTubeTranscriptApi,
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
@@ -86,19 +86,30 @@ async def get_transcript(req: TranscriptRequest):
     async def fetch_transcript():
         nonlocal transcript_result, transcript_error, raw_exception
         try:
-            transcript_result = await loop.run_in_executor(
+            # v1.0 API: YouTubeTranscriptApi.fetch(video_id)
+            fetched = await loop.run_in_executor(
                 None,
-                lambda: YouTubeTranscriptApi.get_transcript(
-                    video_id, languages=["en", "en-US", "en-GB"]
-                ),
+                lambda: YouTubeTranscriptApi.fetch(video_id),
             )
+            transcript_result = [
+                {"text": s.text, "start": s.start, "duration": s.duration}
+                for s in fetched
+            ]
         except TranscriptsDisabled:
             transcript_error = {"status": 404, "error": "no_transcript", "message": "This video doesn't have captions available."}
         except NoTranscriptFound:
+            # Try any available language as fallback
             try:
-                transcript_list = await loop.run_in_executor(None, lambda: YouTubeTranscriptApi.list_transcripts(video_id))
-                transcript_obj = await loop.run_in_executor(None, lambda: next(iter(transcript_list)).fetch())
-                transcript_result = [{"text": s.text, "start": s.start, "duration": s.duration} for s in transcript_obj]
+                transcript_list = await loop.run_in_executor(
+                    None,
+                    lambda: YouTubeTranscriptApi.list(video_id),
+                )
+                first = next(iter(transcript_list))
+                fetched = await loop.run_in_executor(None, lambda: first.fetch())
+                transcript_result = [
+                    {"text": s.text, "start": s.start, "duration": s.duration}
+                    for s in fetched
+                ]
             except Exception as inner_e:
                 raw_exception = f"NoTranscriptFound fallback: {type(inner_e).__name__}: {str(inner_e)}"
                 transcript_error = {"status": 404, "error": "no_transcript", "message": "This video doesn't have captions available."}
@@ -121,14 +132,12 @@ async def get_transcript(req: TranscriptRequest):
             detail["debug"] = raw_exception
         raise HTTPException(status_code=transcript_error["status"], detail=detail)
 
-    normalized = []
-    for s in transcript_result:
-        if isinstance(s, dict):
-            normalized.append({"text": s["text"], "start": s["start"], "duration": s["duration"]})
-        else:
-            normalized.append({"text": s.text, "start": s.start, "duration": s.duration})
-
-    return {"transcript": normalized, "videoTitle": metadata["videoTitle"], "channel": metadata["channel"], "duration": metadata["duration"]}
+    return {
+        "transcript": transcript_result,
+        "videoTitle": metadata["videoTitle"],
+        "channel": metadata["channel"],
+        "duration": metadata["duration"],
+    }
 
 
 if __name__ == "__main__":
