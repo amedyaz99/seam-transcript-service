@@ -1,0 +1,238 @@
+import os
+import re
+import json
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    TranscriptsDisabled,
+    NoTranscriptFound,
+    VideoUnavailable,
+)
+
+app = FastAPI(title="Seam Transcript Service", version="1.0.0")
+
+# Allow requests from the Next.js app (Vercel domain + localhost dev)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten to your Vercel domain in production
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+)
+
+
+class TranscriptRequest(BaseModel):
+    video_id: str
+
+
+def format_duration(seconds: int) -> str:
+    """Format raw seconds into '22 min' or '1h 30m'."""
+    if seconds < 3600:
+        return f"{seconds // 60} min"
+    hours = seconds // 3600
+    mins = (seconds % 3600) // 60
+    return f"{hours}h {mins}m" if mins else f"{hours}h"
+
+
+async def fetch_video_metadata(video_id: str) -> dict:
+    """
+    Scrape title, channel name, and duration directly from YouTube's page HTML.
+    YouTube embeds a JSON blob called ytInitialData — we parse that.
+    Falls back to empty strings if scraping fails (transcript still works).
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+            html = resp.text
+
+        # Title: grab from <title> tag, strip " - YouTube" suffix
+        title_match = re.search(r"<title>(.*?)</title>", html)
+        raw_title = title_match.group(1) if title_match else ""
+        video_title = raw_title.replace(" - YouTube", "").strip()
+
+        # Channel name: YouTube embeds it in the page JSON
+        channel_match = re.search(r'"channelName":"([^"]+)"', html)
+        if not channel_match:
+            # Fallback pattern used in newer YouTube page layouts
+            channel_match = re.search(r'"ownerChannelName":"([^"]+)"', html)
+        channel = channel_match.group(1) if channel_match else ""
+
+        # Duration: lengthSeconds is reliably present in the page JSON blob
+        duration_match = re.search(r'"lengthSeconds":"(\d+)"', html)
+        duration_secs = int(duration_match.group(1)) if duration_match else 0
+        duration = format_duration(duration_secs) if duration_secs else ""
+
+        return {"videoTitle": video_title, "channel": channel, "duration": duration}
+
+    except Exception:
+        # Metadata scraping is best-effort — don't let it kill the transcript
+        return {"videoTitle": "", "channel": "", "duration": ""}
+
+
+def is_shorts(video_id: str) -> bool:
+    """
+    Heuristic: Shorts are typically < 60s. We check transcript duration.
+    We can't reliably detect Shorts by ID alone, so we skip this pre-check
+    and let the caller decide based on duration in the response.
+    """
+    return False  # detection happens post-fetch via duration field
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/transcript")
+async def get_transcript(req: TranscriptRequest):
+    video_id = req.video_id.strip()
+
+    if not video_id or not re.match(r"^[A-Za-z0-9_-]{11}$", video_id):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_id", "message": "Invalid YouTube video ID."},
+        )
+
+    # Fetch transcript and metadata concurrently
+    import asyncio
+
+    transcript_result = None
+    transcript_error = None
+
+    # Transcript fetch is synchronous (the library is sync-only)
+    # Run it in a thread so we don't block the event loop
+    loop = asyncio.get_event_loop()
+
+    async def fetch_transcript():
+        nonlocal transcript_result, transcript_error
+        try:
+            transcript_result = await loop.run_in_executor(
+                None,
+                lambda: YouTubeTranscriptApi.get_transcript(
+                    video_id, languages=["en", "en-US", "en-GB"]
+                ),
+            )
+        except TranscriptsDisabled:
+            transcript_error = {
+                "status": 404,
+                "error": "no_transcript",
+                "message": "This video doesn't have captions available.",
+            }
+        except NoTranscriptFound:
+            # Try any available language as fallback
+            try:
+                transcript_list = await loop.run_in_executor(
+                    None,
+                    lambda: YouTubeTranscriptApi.list_transcripts(video_id),
+                )
+                transcript_obj = await loop.run_in_executor(
+                    None,
+                    lambda: next(iter(transcript_list)).fetch(),
+                )
+                transcript_result = [
+                    {"text": s.text, "start": s.start, "duration": s.duration}
+                    for s in transcript_obj
+                ]
+            except Exception:
+                transcript_error = {
+                    "status": 404,
+                    "error": "no_transcript",
+                    "message": "This video doesn't have captions available.",
+                }
+        except VideoUnavailable:
+            transcript_error = {
+                "status": 403,
+                "error": "restricted",
+                "message": "This video is restricted and can't be processed.",
+            }
+        except Exception as e:
+            err_str = str(e).lower()
+            if "age" in err_str or "sign in" in err_str:
+                transcript_error = {
+                    "status": 403,
+                    "error": "restricted",
+                    "message": "This video is restricted and can't be processed.",
+                }
+            else:
+                transcript_error = {
+                    "status": 500,
+                    "error": "fetch_failed",
+                    "message": "Couldn't fetch the transcript. Try again in a moment.",
+                }
+
+    # Run both concurrently
+    await asyncio.gather(fetch_transcript(), fetch_video_metadata(video_id))
+    metadata = await fetch_video_metadata(video_id)
+
+    if transcript_error:
+        raise HTTPException(
+            status_code=transcript_error["status"],
+            detail={
+                "error": transcript_error["error"],
+                "message": transcript_error["message"],
+            },
+        )
+
+    # Normalise transcript — library returns dicts, but newer versions return objects
+    normalized = []
+    for s in transcript_result:
+        if isinstance(s, dict):
+            normalized.append(
+                {"text": s["text"], "start": s["start"], "duration": s["duration"]}
+            )
+        else:
+            normalized.append(
+                {"text": s.text, "start": s.start, "duration": s.duration}
+            )
+
+    return {
+        "transcript": normalized,
+        "videoTitle": metadata["videoTitle"],
+        "channel": metadata["channel"],
+        "duration": metadata["duration"],
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+```
+
+---
+
+### `Procfile`
+```
+web: uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+*Railway reads this to know how to start the service. The `$PORT` is injected by Railway automatically.*
+
+---
+
+### `runtime.txt`
+```
+python-3.11.9
+```
+
+---
+
+### `.gitignore`
+```
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
