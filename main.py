@@ -48,20 +48,16 @@ async def fetch_video_metadata(video_id: str) -> dict:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             resp = await client.get(url, headers=headers)
             html = resp.text
-
         title_match = re.search(r"<title>(.*?)</title>", html)
         raw_title = title_match.group(1) if title_match else ""
         video_title = raw_title.replace(" - YouTube", "").strip()
-
         channel_match = re.search(r'"channelName":"([^"]+)"', html)
         if not channel_match:
             channel_match = re.search(r'"ownerChannelName":"([^"]+)"', html)
         channel = channel_match.group(1) if channel_match else ""
-
         duration_match = re.search(r'"lengthSeconds":"(\d+)"', html)
         duration_secs = int(duration_match.group(1)) if duration_match else 0
         duration = format_duration(duration_secs) if duration_secs else ""
-
         return {"videoTitle": video_title, "channel": channel, "duration": duration}
     except Exception:
         return {"videoTitle": "", "channel": "", "duration": ""}
@@ -85,9 +81,10 @@ async def get_transcript(req: TranscriptRequest):
     loop = asyncio.get_event_loop()
     transcript_result = None
     transcript_error = None
+    raw_exception = None
 
     async def fetch_transcript():
-        nonlocal transcript_result, transcript_error
+        nonlocal transcript_result, transcript_error, raw_exception
         try:
             transcript_result = await loop.run_in_executor(
                 None,
@@ -96,66 +93,33 @@ async def get_transcript(req: TranscriptRequest):
                 ),
             )
         except TranscriptsDisabled:
-            transcript_error = {
-                "status": 404,
-                "error": "no_transcript",
-                "message": "This video doesn't have captions available.",
-            }
+            transcript_error = {"status": 404, "error": "no_transcript", "message": "This video doesn't have captions available."}
         except NoTranscriptFound:
             try:
-                transcript_list = await loop.run_in_executor(
-                    None,
-                    lambda: YouTubeTranscriptApi.list_transcripts(video_id),
-                )
-                transcript_obj = await loop.run_in_executor(
-                    None,
-                    lambda: next(iter(transcript_list)).fetch(),
-                )
-                transcript_result = [
-                    {"text": s.text, "start": s.start, "duration": s.duration}
-                    for s in transcript_obj
-                ]
-            except Exception:
-                transcript_error = {
-                    "status": 404,
-                    "error": "no_transcript",
-                    "message": "This video doesn't have captions available.",
-                }
+                transcript_list = await loop.run_in_executor(None, lambda: YouTubeTranscriptApi.list_transcripts(video_id))
+                transcript_obj = await loop.run_in_executor(None, lambda: next(iter(transcript_list)).fetch())
+                transcript_result = [{"text": s.text, "start": s.start, "duration": s.duration} for s in transcript_obj]
+            except Exception as inner_e:
+                raw_exception = f"NoTranscriptFound fallback: {type(inner_e).__name__}: {str(inner_e)}"
+                transcript_error = {"status": 404, "error": "no_transcript", "message": "This video doesn't have captions available."}
         except VideoUnavailable:
-            transcript_error = {
-                "status": 403,
-                "error": "restricted",
-                "message": "This video is restricted and can't be processed.",
-            }
+            transcript_error = {"status": 403, "error": "restricted", "message": "This video is restricted and can't be processed."}
         except Exception as e:
+            raw_exception = f"{type(e).__name__}: {str(e)}"
             err_str = str(e).lower()
             if "age" in err_str or "sign in" in err_str:
-                transcript_error = {
-                    "status": 403,
-                    "error": "restricted",
-                    "message": "This video is restricted and can't be processed.",
-                }
+                transcript_error = {"status": 403, "error": "restricted", "message": "This video is restricted and can't be processed."}
             else:
-                transcript_error = {
-                    "status": 500,
-                    "error": "fetch_failed",
-                    "message": "Couldn't fetch the transcript. Try again in a moment.",
-                }
+                transcript_error = {"status": 500, "error": "fetch_failed", "message": "Couldn't fetch the transcript. Try again in a moment."}
 
-    results = await asyncio.gather(
-        fetch_transcript(),
-        fetch_video_metadata(video_id),
-    )
+    results = await asyncio.gather(fetch_transcript(), fetch_video_metadata(video_id))
     metadata = results[1]
 
     if transcript_error:
-        raise HTTPException(
-            status_code=transcript_error["status"],
-            detail={
-                "error": transcript_error["error"],
-                "message": transcript_error["message"],
-            },
-        )
+        detail = {"error": transcript_error["error"], "message": transcript_error["message"]}
+        if raw_exception:
+            detail["debug"] = raw_exception
+        raise HTTPException(status_code=transcript_error["status"], detail=detail)
 
     normalized = []
     for s in transcript_result:
@@ -164,12 +128,7 @@ async def get_transcript(req: TranscriptRequest):
         else:
             normalized.append({"text": s.text, "start": s.start, "duration": s.duration})
 
-    return {
-        "transcript": normalized,
-        "videoTitle": metadata["videoTitle"],
-        "channel": metadata["channel"],
-        "duration": metadata["duration"],
-    }
+    return {"transcript": normalized, "videoTitle": metadata["videoTitle"], "channel": metadata["channel"], "duration": metadata["duration"]}
 
 
 if __name__ == "__main__":
